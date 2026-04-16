@@ -7,6 +7,11 @@ normalisation used by extract_mentions.py (long-s, ligatures, NFKD), then
 checks for whole-word matches.  Matching documents are written to a single
 output JSONL file in the same format produced by prepare_book_samples.py.
 
+By default, work-ID deduplication is applied after the keyword scan: for each
+ESTC work that appears multiple times (different editions / revisions), only
+the document with the earliest publication year is kept.  Pass --no-dedup to
+disable this step and keep all matched documents.
+
 Usage examples:
   # Default paths – keywords.txt, writes books/keywords_match.jsonl
   python3 filter_books_by_keywords.py
@@ -19,6 +24,9 @@ Usage examples:
 
   # Use 8 parallel workers
   python3 filter_books_by_keywords.py --workers 8
+
+  # Skip work-ID deduplication
+  python3 filter_books_by_keywords.py --no-dedup
 """
 
 import argparse
@@ -26,6 +34,7 @@ import json
 import logging
 import multiprocessing as mp
 import re
+import sqlite3
 import sys
 import unicodedata
 from pathlib import Path
@@ -42,6 +51,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DATA_FILE   = "../../../laczakol/shared/ecco_downloaded/ecco_downloaded.jsonl"
 DEFAULT_KEYWORDS    = "keywords.txt"
 DEFAULT_OUTPUT      = "books/keywords_match.jsonl"
+DEFAULT_DB_FILE     = "/scratch/project_2017429/laczakol/shared/experimental/estc_metadata_db/estc.db"
 
 # ---------------------------------------------------------------------------
 # Text normalisation  (mirrors extract_mentions.py)
@@ -81,6 +91,63 @@ def build_pattern(keywords: set[str]) -> re.Pattern:
     """Build a compiled word-boundary regex that matches any keyword."""
     alt = "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
     return re.compile(rf"\b(?:{alt})\b")
+
+
+# ---------------------------------------------------------------------------
+# Work-ID deduplication  (keep earliest edition per work)
+# ---------------------------------------------------------------------------
+
+def _metadata_for_ids(document_ids: list[str], db_file: str) -> dict:
+    """Return a {ecco_id: {work_id, publication_year, finalWorkField}} dict."""
+    with sqlite3.connect(db_file) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        placeholders = ",".join("?" for _ in document_ids)
+        cur.execute(
+            f"""
+            SELECT
+                ip.document_id,
+                m.publication_year,
+                w.work_id,
+                m.finalWorkField
+            FROM idpairs ip
+            LEFT JOIN metadata m
+                ON ip.estc_id_student_edition = m.id
+            LEFT JOIN works w
+                ON w.estc_id = ip.estc_id_student_edition
+            WHERE ip.document_id IN ({placeholders})
+            """,
+            document_ids,
+        )
+        return {row["document_id"]: dict(row) for row in cur.fetchall()}
+
+
+def _work_key(meta: dict, doc_id: str) -> str:
+    """Stable grouping key: work_id if available, else finalWorkField, else doc_id."""
+    wid = meta.get("work_id")
+    return wid if wid is not None else (meta.get("finalWorkField") or doc_id)
+
+
+def _pub_year(meta: dict) -> float:
+    year = meta.get("publication_year")
+    try:
+        return int(year) if year is not None else float("inf")
+    except (ValueError, TypeError):
+        return float("inf")
+
+
+def deduplicate_to_earliest(metadata_map: dict) -> set[str]:
+    """
+    Given {ecco_id: metadata}, return the set of ecco_ids that represent
+    the earliest known edition for each unique work.
+    """
+    best: dict = {}  # work_key -> (doc_id, year)
+    for doc_id, meta in metadata_map.items():
+        key = _work_key(meta, doc_id)
+        year = _pub_year(meta)
+        if key not in best or year < best[key][1]:
+            best[key] = (doc_id, year)
+    return {doc_id for doc_id, _ in best.values()}
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +244,14 @@ def main() -> None:
         "--workers", type=int, default=mp.cpu_count(),
         help=f"Parallel worker processes (default: all CPUs = {mp.cpu_count()})",
     )
+    parser.add_argument(
+        "--db-file", default=DEFAULT_DB_FILE,
+        help=f"ESTC SQLite database for work-ID deduplication (default: {DEFAULT_DB_FILE})",
+    )
+    parser.add_argument(
+        "--no-dedup", action="store_true",
+        help="Skip work-ID deduplication and keep all matched documents",
+    )
     args = parser.parse_args()
 
     # Validate input paths
@@ -211,15 +286,27 @@ def main() -> None:
             f"{year_end   if year_end   else '–'}"
         )
 
+    do_dedup = not args.no_dedup
+    if do_dedup and not Path(args.db_file).exists():
+        logger.warning(
+            f"ESTC DB not found ({args.db_file}); skipping deduplication. "
+            "Pass --no-dedup to silence this warning."
+        )
+        do_dedup = False
+
     logger.info(f"Workers: {args.workers}")
 
-    matched = 0
+    # ------------------------------------------------------------------
+    # Phase 1 — parallel keyword scan; buffer all matched docs in memory.
+    # The matched subset is a tiny fraction of the full corpus so this is
+    # fine.  We need the full JSON later anyway (to write to output).
+    # ------------------------------------------------------------------
+    matched_docs: dict[str, str] = {}   # ecco_id -> raw JSON line
     scanned = 0
 
-    logger.info(f"Streaming {args.data_file} …")
+    logger.info(f"Phase 1/2: streaming {args.data_file} …")
     with (
         open(args.data_file, encoding="utf-8") as data_f,
-        open(output_path, "w", encoding="utf-8") as out_f,
         mp.Pool(
             processes=args.workers,
             initializer=_worker_init,
@@ -228,13 +315,57 @@ def main() -> None:
     ):
         for result in pool.imap(_process_line, data_f, chunksize=50):
             scanned += 1
-            if scanned % 1_000 == 0:
-                logger.info(f"  {scanned:,} docs scanned, {matched:,} matched …")
+            if scanned % 10_000 == 0:
+                logger.info(
+                    f"  {scanned:,} docs scanned, {len(matched_docs):,} matched …"
+                )
             if result is not None:
-                out_f.write(result + "\n")
-                matched += 1
+                doc_id = json.loads(result).get("id")
+                if doc_id:
+                    matched_docs[doc_id] = result
 
-    logger.info(f"Done. Scanned {scanned:,} docs — {matched:,} matched → {output_path}")
+    logger.info(
+        f"Scan complete. Scanned {scanned:,} docs — {len(matched_docs):,} matched."
+    )
+
+    # ------------------------------------------------------------------
+    # Phase 2 — work-ID deduplication via ESTC DB.
+    # ------------------------------------------------------------------
+    if do_dedup:
+        logger.info(
+            f"Phase 2/2: querying ESTC metadata for {len(matched_docs):,} docs …"
+        )
+        metadata_map = _metadata_for_ids(list(matched_docs.keys()), args.db_file)
+        keep_ids = deduplicate_to_earliest(metadata_map)
+
+        # Docs absent from the DB are kept (no work_id → treated as unique works).
+        absent = set(matched_docs.keys()) - set(metadata_map.keys())
+        if absent:
+            logger.info(
+                f"  {len(absent):,} docs not found in ESTC DB — kept as-is."
+            )
+        keep_ids |= absent
+
+        logger.info(
+            f"  {len(matched_docs):,} matched docs → "
+            f"{len(keep_ids):,} after deduplication "
+            f"({len(matched_docs) - len(keep_ids):,} duplicate editions removed)."
+        )
+    else:
+        keep_ids = set(matched_docs.keys())
+        logger.info("Deduplication skipped (--no-dedup).")
+
+    # ------------------------------------------------------------------
+    # Phase 3 — write kept docs to output JSONL.
+    # ------------------------------------------------------------------
+    written = 0
+    with open(output_path, "w", encoding="utf-8") as out_f:
+        for doc_id, line in matched_docs.items():
+            if doc_id in keep_ids:
+                out_f.write(line + "\n")
+                written += 1
+
+    logger.info(f"Done. {written:,} docs written → {output_path}")
 
 
 if __name__ == "__main__":
