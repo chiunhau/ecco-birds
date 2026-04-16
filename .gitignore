@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Data files (large, live on Puhti)
+books/
+*.jsonl
+*.csv
+
+# SLURM job output
+slurm-*.out
+vllm-*.log
+
+# HF model cache
+hf-cache/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

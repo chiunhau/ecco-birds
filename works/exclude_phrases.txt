@@ -1,0 +1,8 @@
+# Per-keyword phrase exclusions for extract_mentions.py
+# Format: label: phrase one, phrase two, "Case Sensitive Phrase"
+# Phrases wrapped in "quotes" are matched case-sensitively;
+# unquoted phrases are matched case-insensitively.
+# The label must match a label defined in keywords.txt.
+# Lines starting with # are ignored.
+
+canary: canary islands, canary island, canary isles, canary grass, canary wine, pint of canary, quart of canary, dose of canary, pipe of canary, pipes of canary, "the Canaries", "The Canaries"
