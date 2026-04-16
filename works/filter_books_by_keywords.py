@@ -77,13 +77,28 @@ def normalize(text: str) -> str:
 
 
 def load_keywords(keywords_file: str) -> set[str]:
-    """Load normalised lowercase keywords from a plain-text file (one per line)."""
+    """Load normalised lowercase keywords from a plain-text file.
+
+    Supports two formats:
+      - One keyword per line:          canary
+      - Group with aliases (new):      canary: canary,canaries
+    """
     path = Path(keywords_file)
     keywords: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
-        word = normalize(line.strip()).lower()
-        if word:
-            keywords.add(word)
+        line = line.strip()
+        if not line:
+            continue
+        # Handle "label: alias1,alias2,..." format
+        if ": " in line:
+            _, _, aliases_part = line.partition(": ")
+            parts = [a.strip() for a in aliases_part.split(",")]
+        else:
+            parts = [line]
+        for part in parts:
+            word = normalize(part).lower()
+            if word:
+                keywords.add(word)
     return keywords
 
 
