@@ -113,7 +113,7 @@ def build_pattern(keywords: set[str]) -> re.Pattern:
 # ---------------------------------------------------------------------------
 
 def _metadata_for_ids(document_ids: list[str], db_file: str) -> dict:
-    """Return a {ecco_id: {work_id, publication_year, finalWorkField}} dict."""
+    """Return a {ecco_id: {work_id, publication_year, author, title, finalWorkField}} dict."""
     with sqlite3.connect(db_file) as conn:
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -123,6 +123,8 @@ def _metadata_for_ids(document_ids: list[str], db_file: str) -> dict:
             SELECT
                 ip.document_id,
                 m.publication_year,
+                m.name_unified AS author,
+                m.title,
                 w.work_id,
                 m.finalWorkField
             FROM idpairs ip
@@ -386,9 +388,18 @@ def main() -> None:
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                doc_id = json.loads(line).get("id")
+                doc = json.loads(line)
+                doc_id = doc.get("id")
                 if doc_id in keep_ids:
-                    out_f.write(line + "\n")
+                    if do_dedup and doc_id in metadata_map:
+                        meta = metadata_map[doc_id]
+                        if not doc.get("year") and meta.get("publication_year"):
+                            doc["year"] = str(meta["publication_year"])
+                        if not doc.get("author") and meta.get("author"):
+                            doc["author"] = meta["author"]
+                        if not doc.get("title") and meta.get("title"):
+                            doc["title"] = meta["title"]
+                    out_f.write(json.dumps(doc, ensure_ascii=False) + "\n")
                     written += 1
     finally:
         tmp_path.unlink(missing_ok=True)

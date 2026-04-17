@@ -5,4 +5,4 @@
 # The label must match a label defined in keywords.txt.
 # Lines starting with # are ignored.
 
-canary: canary islands, canary island, canary isles, canary grass, canary wine, pint of canary, quart of canary, dose of canary, pipe of canary, pipes of canary, "the Canaries", "The Canaries"
+canary: canary islands, canary island, canary isles, canary iflands, canary ilands, island of canary, ifand of canary, canary grass, canary wine, pint of canary, quart of canary, dose of canary, pipe of canary, pipes of canary, gallons of canary, "the Canaries", "The Canaries"

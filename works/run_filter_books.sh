@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --account=project_2017429
-#SBATCH --partition=large
+#SBATCH --partition=small
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
-#SBATCH --time=4:00:00
+#SBATCH --time=00:30:00
 
 source /scratch/project_2017429/chiunhau/my_python_env/bin/activate
 
