@@ -312,16 +312,17 @@ def main() -> None:
     logger.info(f"Workers: {args.workers}")
 
     # ------------------------------------------------------------------
-    # Phase 1 — parallel keyword scan; buffer all matched docs in memory.
-    # The matched subset is a tiny fraction of the full corpus so this is
-    # fine.  We need the full JSON later anyway (to write to output).
+    # Phase 1 — parallel keyword scan; stream matched docs to a temp file
+    # and collect only their IDs in memory for deduplication.
     # ------------------------------------------------------------------
-    matched_docs: dict[str, str] = {}   # ecco_id -> raw JSON line
+    tmp_path = output_path.with_suffix(".tmp.jsonl")
+    matched_ids: list[str] = []
     scanned = 0
 
     logger.info(f"Phase 1/2: streaming {args.data_file} …")
     with (
         open(args.data_file, encoding="utf-8") as data_f,
+        open(tmp_path, "w", encoding="utf-8") as tmp_f,
         mp.Pool(
             processes=args.workers,
             initializer=_worker_init,
@@ -332,15 +333,17 @@ def main() -> None:
             scanned += 1
             if scanned % 10_000 == 0:
                 logger.info(
-                    f"  {scanned:,} docs scanned, {len(matched_docs):,} matched …"
+                    f"  {scanned:,} docs scanned, {len(matched_ids):,} matched …"
                 )
             if result is not None:
                 doc_id = json.loads(result).get("id")
                 if doc_id:
-                    matched_docs[doc_id] = result
+                    matched_ids.append(doc_id)
+                    tmp_f.write(result + "\n")
 
+    n_matched = len(matched_ids)
     logger.info(
-        f"Scan complete. Scanned {scanned:,} docs — {len(matched_docs):,} matched."
+        f"Scan complete. Scanned {scanned:,} docs — {n_matched:,} matched."
     )
 
     # ------------------------------------------------------------------
@@ -348,13 +351,13 @@ def main() -> None:
     # ------------------------------------------------------------------
     if do_dedup:
         logger.info(
-            f"Phase 2/2: querying ESTC metadata for {len(matched_docs):,} docs …"
+            f"Phase 2/2: querying ESTC metadata for {n_matched:,} docs …"
         )
-        metadata_map = _metadata_for_ids(list(matched_docs.keys()), args.db_file)
+        metadata_map = _metadata_for_ids(matched_ids, args.db_file)
         keep_ids = deduplicate_to_earliest(metadata_map)
 
         # Docs absent from the DB are kept (no work_id → treated as unique works).
-        absent = set(matched_docs.keys()) - set(metadata_map.keys())
+        absent = set(matched_ids) - set(metadata_map.keys())
         if absent:
             logger.info(
                 f"  {len(absent):,} docs not found in ESTC DB — kept as-is."
@@ -362,23 +365,33 @@ def main() -> None:
         keep_ids |= absent
 
         logger.info(
-            f"  {len(matched_docs):,} matched docs → "
+            f"  {n_matched:,} matched docs → "
             f"{len(keep_ids):,} after deduplication "
-            f"({len(matched_docs) - len(keep_ids):,} duplicate editions removed)."
+            f"({n_matched - len(keep_ids):,} duplicate editions removed)."
         )
     else:
-        keep_ids = set(matched_docs.keys())
+        keep_ids = set(matched_ids)
         logger.info("Deduplication skipped (--no-dedup).")
 
     # ------------------------------------------------------------------
-    # Phase 3 — write kept docs to output JSONL.
+    # Phase 3 — stream the temp file, write kept docs to final output.
     # ------------------------------------------------------------------
     written = 0
-    with open(output_path, "w", encoding="utf-8") as out_f:
-        for doc_id, line in matched_docs.items():
-            if doc_id in keep_ids:
-                out_f.write(line + "\n")
-                written += 1
+    try:
+        with (
+            open(tmp_path, encoding="utf-8") as tmp_f,
+            open(output_path, "w", encoding="utf-8") as out_f,
+        ):
+            for line in tmp_f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                doc_id = json.loads(line).get("id")
+                if doc_id in keep_ids:
+                    out_f.write(line + "\n")
+                    written += 1
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     logger.info(f"Done. {written:,} docs written → {output_path}")
 
